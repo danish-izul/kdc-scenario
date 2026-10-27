@@ -1,94 +1,159 @@
-#include "bytes.hpp"
+#include "cbc.hpp"
 
-#include <fstream>
+#include <cstring>
+#include <set>
 
-std::string to_hex(const uint8_t* p, size_t n, bool spaced) {
-    static const char* digits = "0123456789abcdef";
-    std::string s;
-    s.reserve(n * 3);
-    for (size_t i = 0; i < n; ++i) {
-        if (spaced && i) s += ' ';
-        s += digits[p[i] >> 4];
-        s += digits[p[i] & 0x0f];
-    }
-    return s;
+#include "aes256.hpp"
+#include "trace.hpp"
+
+namespace cbc {
+
+using trace::col::cyan;
+using trace::col::green;
+using trace::col::red;
+using trace::col::yellow;
+
+static std::string hex8(uint8_t v) { return "0x" + to_hex(&v, 1); }
+
+Bytes pkcs7_pad(const Bytes& in) {
+    const size_t n = aes::kBlock - in.size() % aes::kBlock;
+    Bytes out(in);
+    out.insert(out.end(), n, static_cast<uint8_t>(n));
+    return out;
 }
 
-static int hex_val(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+Bytes pkcs7_unpad(const Bytes& in) {
+    if (in.empty() || in.size() % aes::kBlock)
+        throw CryptoError("bad padding: length is not a positive multiple of 16");
+    const uint8_t n = in.back();
+    if (n == 0 || n > aes::kBlock)
+        throw CryptoError("bad padding: last byte " + hex8(n) + " is not in 0x01..0x10 (wrong key or tampered data)");
+    for (size_t i = in.size() - n; i < in.size(); ++i)
+        if (in[i] != n)
+            throw CryptoError("bad padding: expected " + std::to_string(n) + " bytes of " + hex8(n) +
+                              " (wrong key or tampered data)");
+    return Bytes(in.begin(), in.end() - n);
 }
 
-Bytes from_hex(const std::string& hex) {
-    std::string h;
-    for (char c : hex)
-        if (c != ' ') h += c;
-    if (h.size() % 2) throw std::invalid_argument("odd number of hex digits");
-    Bytes out(h.size() / 2);
-    for (size_t i = 0; i < out.size(); ++i) {
-        int hi = hex_val(h[2 * i]), lo = hex_val(h[2 * i + 1]);
-        if (hi < 0 || lo < 0) throw std::invalid_argument("bad hex digit");
-        out[i] = static_cast<uint8_t>(hi << 4 | lo);
+static std::set<Bytes> g_shown_keys;
+static void check_key(const Bytes& key) {
+    if (key.size() != aes::kKeyLen) throw std::invalid_argument("AES-256 key must be 32 bytes");
+}
+static bool show_schedule(const Bytes& key, bool show) {
+    if (!show || !trace::on(2) || g_shown_keys.count(key)) return false;
+    g_shown_keys.insert(key);
+    return true;
+}
+
+Bytes encrypt(const Bytes& key, const uint8_t iv[16], const Bytes& plaintext, bool show) {
+    check_key(key);
+    if (plaintext.size() % aes::kBlock) throw std::invalid_argument("CBC input must be a multiple of 16 bytes");
+    aes::Aes256 cipher(key.data(), show_schedule(key, show));
+    const size_t blocks = plaintext.size() / aes::kBlock;
+    Bytes out(plaintext.size());
+    uint8_t prev[16], x[16];
+    std::memcpy(prev, iv, 16);
+    for (size_t b = 0; b < blocks; ++b) {
+        const uint8_t* p = &plaintext[16 * b];
+        uint8_t* c = &out[16 * b];
+        for (int i = 0; i < 16; ++i) x[i] = p[i] ^ prev[i];
+        const bool blk = show && trace::on(1);
+        if (blk) {
+            const std::string i = std::to_string(b + 1), j = std::to_string(b);
+            trace::out("      Block " + i + "/" + std::to_string(blocks) + ":");
+            trace::hexline(8, "P_" + i, p, 16, green);
+            trace::hexline(8, b == 0 ? "C_0 (= IV)" : "C_" + j, prev, 16);
+            trace::hexline(8, "P_" + i + " XOR C_" + j, x, 16);
+        }
+        cipher.encrypt_block(x, c, show && trace::on(2));
+        if (blk) trace::hexline(8, "C_" + std::to_string(b + 1) + " = AES_K(.)", c, 16, red);
+        std::memcpy(prev, c, 16);
     }
     return out;
 }
 
-Bytes to_bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
-std::string to_text(const Bytes& b) { return std::string(b.begin(), b.end()); }
-
-std::string ascii(const uint8_t* p, size_t n) {
-    std::string s;
-    for (size_t i = 0; i < n; ++i) s += (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
-    return s;
+Bytes decrypt(const Bytes& key, const uint8_t iv[16], const Bytes& ciphertext, bool show) {
+    check_key(key);
+    if (ciphertext.empty() || ciphertext.size() % aes::kBlock)
+        throw CryptoError("ciphertext length " + std::to_string(ciphertext.size()) +
+                          " is not a positive multiple of 16");
+    aes::Aes256 cipher(key.data(), show_schedule(key, show));
+    const size_t blocks = ciphertext.size() / aes::kBlock;
+    Bytes out(ciphertext.size());
+    uint8_t prev[16], x[16];
+    std::memcpy(prev, iv, 16);
+    for (size_t b = 0; b < blocks; ++b) {
+        const uint8_t* c = &ciphertext[16 * b];
+        uint8_t* p = &out[16 * b];
+        const bool blk = show && trace::on(1);
+        const std::string i = std::to_string(b + 1), j = std::to_string(b);
+        if (blk) {
+            trace::out("      Block " + i + "/" + std::to_string(blocks) + ":");
+            trace::hexline(8, "C_" + i, c, 16, red);
+        }
+        cipher.decrypt_block(c, x, show && trace::on(2));
+        for (int k = 0; k < 16; ++k) p[k] = x[k] ^ prev[k];
+        if (blk) {
+            trace::hexline(8, "AES^-1_K(C_" + i + ")", x, 16);
+            trace::hexline(8, b == 0 ? "C_0 (= IV)" : "C_" + j, prev, 16);
+            trace::hexline(8, "P_" + i + " = D XOR C_" + j, p, 16, green);
+        }
+        std::memcpy(prev, c, 16);
+    }
+    return out;
 }
 
-void put_u8(Bytes& b, uint8_t v) { b.push_back(v); }
-void put_u16(Bytes& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>(v >> 8));
-    b.push_back(static_cast<uint8_t>(v));
-}
-void put_u32(Bytes& b, uint32_t v) {
-    for (int i = 3; i >= 0; --i) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
-}
-void put_u64(Bytes& b, uint64_t v) {
-    for (int i = 7; i >= 0; --i) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
-}
-uint16_t get_u16(const uint8_t* p) { return static_cast<uint16_t>(p[0] << 8 | p[1]); }
-uint32_t get_u32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) << 24 | static_cast<uint32_t>(p[1]) << 16 |
-           static_cast<uint32_t>(p[2]) << 8 | p[3];
-}
-uint64_t get_u64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = v << 8 | p[i];
-    return v;
-}
-Bytes be64(uint64_t v) {
-    Bytes b;
-    put_u64(b, v);
-    return b;
+Bytes seal(const Bytes& key, const Bytes& plaintext, const std::string& key_name, const std::string& what) {
+    trace::section("AES-256-CBC ENCRYPT  " + what + "  with " + key_name);
+    Bytes iv = random_bytes(16);
+    trace::kv(4, "key " + key_name, to_hex(key), yellow);
+    trace::kv(4, "IV (fresh random)", to_hex(iv), cyan);
+    trace::hexdump(4, "plaintext", plaintext, green);
+
+    Bytes padded = pkcs7_pad(plaintext);
+    const uint8_t n = padded.back();
+    trace::kv(4, "PKCS#7 padding", std::to_string(plaintext.size()) + " bytes + " + std::to_string(n) + " x " +
+                                       hex8(n) + " = " + std::to_string(padded.size()) + " bytes = " +
+                                       std::to_string(padded.size() / 16) + " block(s)");
+    if (trace::on(1)) trace::hexdump(4, "padded plaintext", padded, green);
+    if (trace::on(1)) trace::out("    CBC chaining: C_0 = IV, C_i = AES_K(P_i XOR C_{i-1})");
+
+    Bytes ct = encrypt(key, iv.data(), padded, true);
+    trace::hexdump(4, "ciphertext C_1..C_" + std::to_string(ct.size() / 16), ct, red);
+
+    Bytes sealed(iv);
+    sealed.insert(sealed.end(), ct.begin(), ct.end());
+    trace::kv(4, "output", "IV || ciphertext = " + std::to_string(sealed.size()) + " bytes");
+    wipe(padded);
+    return sealed;
 }
 
-void random_fill(uint8_t* out, size_t n) {
-    std::ifstream f("/dev/urandom", std::ios::binary);
-    if (!f.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n)))
-        throw std::runtime_error("cannot read /dev/urandom");
-}
-Bytes random_bytes(size_t n) {
-    Bytes b(n);
-    random_fill(b.data(), n);
-    return b;
-}
-uint64_t random_u64() {
-    uint8_t b[8];
-    random_fill(b, 8);
-    return get_u64(b);
+Bytes open(const Bytes& key, const Bytes& sealed, const std::string& key_name, const std::string& what) {
+    trace::section("AES-256-CBC DECRYPT  " + what + "  with " + key_name);
+    if (sealed.size() < 32 || sealed.size() % 16)
+        throw CryptoError("sealed message of " + std::to_string(sealed.size()) +
+                          " bytes cannot be IV || ciphertext (need 16 + 16k bytes)");
+    Bytes iv(sealed.begin(), sealed.begin() + 16);
+    Bytes ct(sealed.begin() + 16, sealed.end());
+    trace::kv(4, "key " + key_name, to_hex(key), yellow);
+    trace::kv(4, "IV (first 16 bytes)", to_hex(iv), cyan);
+    trace::hexdump(4, "ciphertext", ct, red);
+    if (trace::on(1)) trace::out("    CBC chaining: P_i = AES^-1_K(C_i) XOR C_{i-1}, C_0 = IV");
+
+    Bytes padded = decrypt(key, iv.data(), ct, true);
+    if (trace::on(1)) trace::hexdump(4, "padded plaintext", padded, green);
+    const uint8_t n = padded.back();
+    Bytes pt;
+    try {
+        pt = pkcs7_unpad(padded);
+    } catch (const CryptoError& e) {
+        throw CryptoError("decryption with " + key_name + " failed, " + e.what());
+    }
+    trace::kv(4, "PKCS#7 check", "last byte " + hex8(n) + " -> remove " + std::to_string(n) + " bytes, all equal " +
+                                     hex8(n) + "  OK", green);
+    trace::hexdump(4, "plaintext", pt, green);
+    wipe(padded);
+    return pt;
 }
 
-void wipe(Bytes& b) {
-    volatile uint8_t* p = b.data();
-    for (size_t i = 0; i < b.size(); ++i) p[i] = 0;
-    b.clear();
-}
+} // namespace cbc
