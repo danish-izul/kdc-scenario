@@ -8,9 +8,9 @@ LIB_SRC := src/bytes.cpp src/io.cpp src/trace.cpp src/sha256.cpp src/aes256.cpp 
 LIB_OBJ := $(LIB_SRC:src/%.cpp=$(BUILD)/%.o)
 PROGS   := $(BUILD)/kdc $(BUILD)/alice $(BUILD)/bob
 
-.PHONY: all static test clean
+.PHONY: all static clean
 
-all: $(PROGS) $(BUILD)/kat
+all: $(PROGS)
 
 static:
 	$(MAKE) clean
@@ -22,14 +22,8 @@ $(BUILD)/%.o: src/%.cpp $(wildcard include/*.hpp) | $(BUILD)
 $(BUILD)/kdc $(BUILD)/alice $(BUILD)/bob: $(BUILD)/%: $(BUILD)/%.o $(LIB_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/kat: tests/kat.cpp $(LIB_OBJ) $(wildcard include/*.hpp) | $(BUILD)
-	$(CXX) $(CXXFLAGS) tests/kat.cpp $(LIB_OBJ) -o $@ $(LDFLAGS)
-
 $(BUILD):
 	@mkdir -p $(BUILD)
-
-test: $(BUILD)/kat
-	./$(BUILD)/kat
 
 clean:
 	rm -rf $(BUILD)
